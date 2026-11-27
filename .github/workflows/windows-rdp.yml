@@ -1,0 +1,144 @@
+name: Temporary Windows RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      client_ip:
+        description: Your connecting device's Tailscale IPv4 address
+        required: true
+        type: string
+      session_minutes:
+        description: Session minutes after setup, from 1 to 330
+        required: true
+        default: '330'
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: windows-rdp-session
+  cancel-in-progress: false
+
+jobs:
+  desktop:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate configuration
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          CLIENT_IP: ${{ inputs.client_ip }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RDP_PASSWORD.Length -lt 16) {
+            throw 'Set the RDP_PASSWORD repository secret to a unique password of at least 16 characters.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw 'Set the TAILSCALE_AUTHKEY repository secret before starting.'
+          }
+          $address = [ipaddress]::Parse($env:CLIENT_IP)
+          $octets = $address.GetAddressBytes()
+          if ($octets.Length -ne 4 -or $octets[0] -ne 100 -or $octets[1] -lt 64 -or $octets[1] -gt 127) {
+            throw 'client_ip must be your connecting device Tailscale IPv4 address in 100.64.0.0/10.'
+          }
+          $minutes = [int]$env:SESSION_MINUTES
+          if ($minutes -lt 1 -or $minutes -gt 330) {
+            throw 'session_minutes must be between 1 and 330.'
+          }
+
+      - name: Install signed Tailscale package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'tailscale.msi'
+          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-1.104.7-amd64.msi' -OutFile $installer
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Tailscale') {
+            throw 'The Tailscale installer signature could not be verified.'
+          }
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', "`"$installer`"", '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installer failed with exit code $($process.ExitCode)."
+          }
+
+      - name: Join Tailscale
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          & $tailscale up --auth-key=$env:TS_AUTHKEY --hostname="gh-rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --unattended --timeout=120s
+          if ($LASTEXITCODE -ne 0) { throw 'Tailscale sign-in failed. Check the auth key and device approval settings.' }
+          $hostIP = & $tailscale ip -4
+          if ($LASTEXITCODE -ne 0 -or -not $hostIP) { throw 'The runner has no Tailscale IPv4 address.' }
+          "TAILSCALE_IP=$($hostIP.Trim())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure RDP over Tailscale
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          CLIENT_IP: ${{ inputs.client_ip }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = New-LocalUser -Name 'rdpuser' -Password $password -AccountNeverExpires
+          foreach ($sid in @('S-1-5-32-544', 'S-1-5-32-555')) {
+            $group = Get-LocalGroup -SID $sid
+            Add-LocalGroupMember -Group $group -Member $user
+          }
+          $adapter = Get-NetIPAddress -IPAddress $env:TAILSCALE_IP -AddressFamily IPv4
+          New-NetFirewallRule -Name 'TemporaryTailscaleRdp' -DisplayName 'Temporary Tailscale RDP client' `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -Profile Any `
+            -LocalAddress $env:TAILSCALE_IP -RemoteAddress $env:CLIENT_IP `
+            -InterfaceAlias $adapter.InterfaceAlias -Service TermService | Out-Null
+          Get-NetFirewallRule -Name 'RemoteDesktop-UserMode-In-*' -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule | Out-Null
+          $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+          Set-ItemProperty -Path "$terminalServer\WinStations\RDP-Tcp" -Name SecurityLayer -Value 2
+          Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0
+          Start-Service TermService
+          $listening = $false
+          for ($attempt = 0; $attempt -lt 12; $attempt++) {
+            if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) {
+              $listening = $true
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $listening) { throw 'The RDP listener did not start.' }
+          @(
+            '## Connection details',
+            '',
+            "Address $env:TAILSCALE_IP",
+            '',
+            "Windows username $env:COMPUTERNAME\rdpuser",
+            '',
+            'Use the password saved in your RDP_PASSWORD repository secret.',
+            '',
+            'Connect from the designated Tailscale client. Back up your files before the session ends.'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Keep session available
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          $end = (Get-Date).AddMinutes([int]$env:SESSION_MINUTES)
+          while ((Get-Date) -lt $end) {
+            Write-Host "Session available until $($end.ToUniversalTime().ToString('u')). Cancel this workflow to stop early."
+            $remaining = [math]::Ceiling(($end - (Get-Date)).TotalSeconds)
+            Start-Sleep -Seconds ([math]::Max(1, [math]::Min(60, $remaining)))
+          }
+
+      - name: Disconnect temporary access
+        if: ${{ always() }}
+        run: |
+          $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (Test-Path -LiteralPath $tailscale) { & $tailscale logout }
+          Get-NetFirewallRule -Name 'TemporaryTailscaleRdp' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction Continue
+          Get-LocalUser -Name 'rdpuser' -ErrorAction SilentlyContinue |
+            Remove-LocalUser -ErrorAction Continue
